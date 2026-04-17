@@ -951,9 +951,12 @@ function processBody(bodyStr, config, reqPath) {
     }
   }
 
-  // Prompt caching: inject cache_control breakpoints on last tool and last
-  // system element for clients that don't already use caching.
-  m = ensureCacheControl(m);
+  // Prompt caching: DISABLED in billing-proxy. CLIProxyAPI downstream handles
+  // cache_control injection more comprehensively (tools + system + messages)
+  // with TTL normalization and 4-breakpoint limit enforcement. If billing-proxy
+  // injects first, CLIProxyAPI detects existing breakpoints and skips its own
+  // superior injection, losing the messages-level cache breakpoint.
+  // m = ensureCacheControl(m);
 
   return unmaskThinkingBlocks(m, thinkMasks);
 }
