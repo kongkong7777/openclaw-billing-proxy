@@ -1084,16 +1084,13 @@ function startServer(config) {
         headers[k] = v;
       }
 
-      // Extract model from body so we can pick only the betas valid for it.
-      // See getModelBetas(). Falls back to the full REQUIRED_BETAS list if
-      // the model string can't be found in the body.
-      const modelMatch = /"model"\s*:\s*"([^"]+)"/.exec(bodyStr);
-      const bodyModel = modelMatch ? modelMatch[1] : '';
-      const modelBetas = bodyModel ? getModelBetas(bodyModel) : REQUIRED_BETAS;
-      const existingBeta = headers['anthropic-beta'] || '';
-      const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
-      for (const b of modelBetas) { if (!betas.includes(b)) betas.push(b); }
-      headers['anthropic-beta'] = betas.join(',');
+      // Beta flags: DISABLED in billing-proxy. CLIProxyAPI downstream has more
+      // comprehensive betas (structured-outputs, fast-mode, redact-thinking,
+      // token-efficient-tools). When billing-proxy sets Anthropic-Beta, CLIProxyAPI
+      // detects the incoming header and REPLACES its own defaults with billing-proxy's
+      // smaller set, losing 4 useful betas. By not setting the header, CLIProxyAPI
+      // uses its full default list.
+      // headers['anthropic-beta'] = ...;
 
       const ts = new Date().toISOString().substring(11, 19);
       console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
