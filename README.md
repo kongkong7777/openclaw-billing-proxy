@@ -1,139 +1,179 @@
-# OpenClaw Billing Proxy（中文版）
+# OpenClaw Billing Proxy（kongkong7777 Fork · 中文版）
 
-让 OpenClaw 使用 Claude Max/Pro 套餐内额度，而不走 Extra Usage 额外计费。
+让第三方 AI 客户端（OpenClaw / LobeChat / NextChat / Hermes 等）复用 Claude Max/Pro 套餐内额度，同时接通 OpenAI / Gemini / Codex / Kimi 等多厂商模型池。
 
-**零额外成本 · 完整 OpenClaw 功能 · 无需修改 OpenClaw 代码**
-
----
-
-## 背景
-
-2026 年 4 月 4 日，Anthropic 封锁了第三方工具（包括 OpenClaw）直接使用 Claude 订阅额度。所有非 Claude Code 的请求都被路由到 Extra Usage（按量付费）。
-
-本项目通过在 OpenClaw 和 Anthropic API 之间插入一层代理，将请求伪装成 Claude Code 会话，从而继续使用套餐内额度。
+**本 Fork 专为与 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 串接的 Plan B 架构优化**。独立部署（直连 api.anthropic.com）也能跑，但诸多细节是按"串接"假设设计的。
 
 ---
 
-## 原理
+## 零、这个 Fork 跟上游有什么不同
 
-Anthropic 使用**四层检测机制**识别第三方工具：
-
-| 层 | 检测方式 | 本项目的对策 |
-|---|---|---|
-| **L1: Billing Header** | 检查系统提示中的 `x-anthropic-billing-header` | 注入 84 字符的 Claude Code 计费标识（含 SHA256 动态哈希） |
-| **L2: 关键词扫描** | 扫描请求体中的 ~30 个已知触发词 | 29 组全局查找替换（OpenClaw→OCPlatform 等） |
-| **L3: 工具名指纹** | 分析工具名组合，匹配 OpenClaw 的 29 个工具 | 将所有工具重命名为 PascalCase Claude Code 风格 + 注入 5 个假 CC 工具 |
-| **L4: 系统提示模板匹配** | 匹配 OpenClaw 特有的 ~28K 字符结构化段落 | 剥离配置段落，替换为 ~500 字符的自然语言 |
-
-**检测是累积评分的**——必须同时应对所有四层。
+三句话总结：
+1. **不再直连 Anthropic**，下游改走 CLIProxyAPI 的 `127.0.0.1:18801`，由 CLIProxyAPI 负责 OAuth 账号池、CCH 签名、HTTP header 级 CC 指纹重建
+2. **职责边界清晰**：本 proxy 只做 **body 层**的伪装与修复；HTTP header 层（`User-Agent` / `X-Stainless-*` / `Anthropic-Beta` / 会话 ID / CCH 签名）**完全交给 CLIProxyAPI**
+3. **吸收了 opencode-claude-auth 的 body-level 修复**（见[版本历史](#版本历史)），例如非 CC 工具名加 `mcp_` 前缀、Haiku 的 `effort` 参数剥离、孤立 `tool_use`/`tool_result` 修复、billing 文本块里用真 SHA256 替代硬编码 `cch=00000` 等
 
 ---
 
-## 架构
+## 一、Plan B 架构总览
 
 ```
-OpenClaw
-  │
-  │ /v1/messages (Anthropic 格式)
-  ▼
-┌────────────────────────────────────┐
-│  Nginx (:443 TLS)                  │
-│  按域名/路径路由                    │
-└────────────┬───────────────────────┘
-             │
-             ▼
-┌────────────────────────────────────┐
-│  Billing Proxy (:18804)            │
-│                                    │
-│  出站处理（7 层）：                  │
-│  1. 注入 Billing Header            │
-│  2. 替换 OAuth Token               │
-│  3. 关键词替换（29 组）             │
-│  4. 工具名 PascalCase 重命名       │
-│  5. 系统提示模板剥离               │
-│  6. 工具描述删除                   │
-│  7. 属性重命名 + 尾部消息剥离       │
-│                                    │
-│  入站处理：                         │
-│  全部反向还原（工具名/属性/关键词） │
-│  SSE 流式逐 chunk 处理             │
-└────────────┬───────────────────────┘
-             │
-             ▼
-       api.anthropic.com
-       （走套餐内额度）
+                   ┌───────────────────────────┐
+                   │  客户端                   │
+                   │  (OpenClaw / LobeChat /   │
+                   │   NextChat / Hermes 等)   │
+                   └──────────────┬────────────┘
+                                  │  HTTPS
+                                  ▼
+              ┌─────────────────────────────────────┐
+              │  Nginx :443 (TLS 终结 + 路由)       │
+              └──┬──────────────────────────┬───────┘
+                 │ /v1/messages*            │ /v1/chat/completions
+                 │ (Claude 原生格式)         │ /v1/responses
+                 │                          │ (OpenAI 兼容格式)
+                 ▼                          ▼
+         ┌───────────────────┐       ┌───────────────────┐
+         │  billing-proxy    │       │  CLIProxyAPI      │
+         │  :18804           │       │  :18801           │
+         │                   │       │                   │
+         │  ◆ body-level     │       │  ◆ OAuth 账号池    │
+         │    伪装 10 层     │       │    (3 Claude +    │
+         │  ◆ 发往           │──────▶│     2 Codex + …)   │
+         │    CLIProxyAPI     │       │  ◆ HTTP header     │
+         │    :18801         │       │    CC 指纹重建     │
+         └───────────────────┘       │  ◆ CCH 签名        │
+                                     │  ◆ 多厂商路由      │
+                                     └─────────┬─────────┘
+                                               │
+                                               ▼
+                                    ┌──────────────────────┐
+                                    │ api.anthropic.com    │
+                                    │ api.openai.com       │
+                                    │ Google Vertex/AI…    │
+                                    └──────────────────────┘
 ```
+
+**关键点：Anthropic 收到的**：
+- **body 内容**（messages / tools / system 的文本和结构）→ 完全由 billing-proxy 决定
+- **HTTP 请求头**（UA / Stainless / Beta / 会话 / CCH）→ 完全由 CLIProxyAPI 决定
 
 ---
 
-## 部署
+## 二、billing-proxy 实际在做什么
 
-### 前提条件
+以下是所有**真实生效**的 body-level 变换：
 
+| Layer | 作用 | 对应 Anthropic 检测 |
+|-------|------|---|
+| **1. Billing 文本块注入** | 在 system 数组插入 `x-anthropic-billing-header: cc_version=<ver>.<fp>; cc_entrypoint=cli; cch=<sha256[:5]>;` 文本 | telemetry/指纹 |
+| **2. 关键词替换** | 40 组对称 sanitize（OpenClaw→OCPlatform / LobeChat→Driftwave / NextChat→Swiftline 等） | 品牌关键词扫描 |
+| **2.5. Haiku `effort` 剥离** | 侦测 Haiku 模型 → 剥掉 `output_config.effort` 和 `thinking.effort` | Haiku 对 effort 参数返 400 |
+| **3. 工具名重写** | 37 条 rename：CC 官方工具映射到 PascalCase（`read`→`Read`、`write`→`Write` 等），非 CC 工具加 `mcp_` 前缀（`pdf`→`mcp_PdfParse`、`music_generate`→`mcp_MusicCreate` 等） | 工具名集合指纹 |
+| **4. System prompt 剥离** | 删除 OpenClaw 配置段（~28K 字符 tooling/workspace/messaging 模板），替换为简短自然语言 | 系统模板签名 |
+| **5. CC_TOOL_STUBS 注入** | 在 tools 数组追加 `mcp_Glob` / `mcp_Grep` / `mcp_Agent` / `mcp_NotebookEdit` / `mcp_TodoRead` 5 条假工具，带 case-insensitive 去重 | 工具集对比 CC 基线 |
+| **6. 属性名重写** | `session_id`→`thread_id` / `conversation_id`→`thread_ref` 等 8 条 | schema 属性指纹 |
+| **8. 尾部 prefill 剥离** | 去掉非 CC 客户端的 trailing assistant prefill | Opus 4.6+ 兼容 |
+| **count_tokens 本地拦截** | `/v1/messages/count_tokens*` 在 billing-proxy 入口直接返回启发式估算（text × 0.3 + 5%），**不发上游**，零计费 | 避免 extra usage 扣费 |
+| **文件路径保护** | Layer 2 执行前用 NUL 占位符保护所有文件系统路径（Unix/Win 都支持），防止 `/home/user/.openclaw` 被替换成 `/home/user/.ocplatform` | issue #29 ENOENT |
+| **thinking block 保护** | mask/unmask `thinking` 和 `redacted_thinking` content block，避免 reverseMap 破坏 byte-exact 签名 | PR #28 / issue #45 |
+| **prompt caching 注入** | 未显式设置 `cache_control` 的客户端，自动在 tools/system 末尾加 ephemeral 断点（5 分钟 TTL，0.1× 输入成本）| 省钱，实测命中率 ~87% |
+| **孤立 tool block 修复** | 清理无配对的 `tool_use` / `tool_result`，保守处理相邻同 role 消息 | issue #34 |
+
+---
+
+## 三、"僵尸代码"说明
+
+在 Plan B 架构下，以下代码**仍然保留**在 `proxy.js`，但**实际不发挥作用**（被下游 CLIProxyAPI 覆盖）：
+
+| 代码段 | 不起作用的原因 |
+|---|---|
+| `REQUIRED_BETAS` 数组 | 我们的 beta header 注入是注释掉的（见 `headers['anthropic-beta'] = ...;` 所在处）。CLIProxyAPI 的 `applyClaudeHeaders()` 用自己硬编码的 baseBetas（含 `fast-mode-2026-02-01` 等 9 条）。要改 betas 必须改 CLIProxyAPI。 |
+| `getModelBetas(model)` | 调用后结果没写入 header/body，纯摆设。 |
+| `getStainlessHeaders()` | 注入的 `x-stainless-*` 会被 CLIProxyAPI 的 `misc.ScrubProxyAndFingerprintHeaders()` 全部 del，然后由 `applyClaudeHeaders` 按 CLIProxyAPI 的 device profile 重新设置（默认 PackageVersion=0.74.0）。 |
+| `user-agent: claude-cli/<VER>` 注入 | 同上，被 CLIProxyAPI 的 device profile 覆盖。 |
+
+保留原因：零代码负担、方便对比 upstream 变化、万一某天不走 CLIProxyAPI 还能独立兜底。
+
+**想改 HTTP header 层的伪装？去改 CLIProxyAPI。本仓库只管 body。**
+
+---
+
+## 四、部署
+
+### 4.1 前置要求
+
+- Linux 服务器（脚本以 Ubuntu/Debian 为例）
 - Node.js 18+
-- Claude Max 或 Pro 订阅
-- Claude Code CLI 已安装并登录（`claude auth login`）
-- OpenClaw 正在运行
+- **[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)** 已部署并运行于 `127.0.0.1:18801`，至少配置一个 Claude OAuth 账号
+- Nginx 或类似 TLS 终结层（可选，但推荐）
 
-### Step 1: 安装
+### 4.2 CLIProxyAPI 配置关键项
+
+在 CLIProxyAPI 的 `~/.cli-proxy-api/config.yaml` 里，**至少**需要：
+
+```yaml
+port: 18801
+tls:
+  enable: false          # 由 nginx 做 TLS 终结
+debug: true              # 打开 debug 日志（claude-watchdog 依赖这一点）
+
+experimental-cch-signing: true    # 必须开启（OAuth 默认也会开）
+
+api-keys:
+  - "sk-YourCustomKey"   # 客户端 → 本代理用的 key
+
+# OAuth Claude 账号池（至少 1 个）
+# 用 CLIProxyAPI 自带 CLI 登录后会在 ~/.cli-proxy-api/ 生成 claude-*.json
+# 账号池文件自动发现，不用显式列出
+
+# OpenAI / Gemini / Codex 账号池按需配置
+```
+
+详见 [CLIProxyAPI 官方文档](https://github.com/router-for-me/CLIProxyAPI#configuration)。
+
+### 4.3 billing-proxy 部署
 
 ```bash
 git clone https://github.com/kongkong7777/openclaw-billing-proxy.git
 cd openclaw-billing-proxy
-```
 
-### Step 2: 配置
-
-运行自动配置：
-
-```bash
-node setup.js
-```
-
-或手动创建 `config.json`：
-
-```json
+# 创建 config.json（下游地址指向 CLIProxyAPI）
+cat > config.json <<'EOF'
 {
   "port": 18804,
-  "credentialsPath": "~/.claude/.credentials.json",
+  "upstreamHost": "127.0.0.1",
+  "upstreamPort": 18801,
+  "upstreamProtocol": "http",
+  "authMode": "x-api-key",
+  "apiKey": "sk-YourCustomKey",
   "stripToolDescriptions": true,
-  "injectCCStubs": true
+  "injectCCStubs": true,
+  "stripTrailingAssistantPrefill": true
 }
-```
+EOF
 
-### Step 3: 启动
-
-```bash
+# 测试启动
 node proxy.js
+
+# 应看到日志
+# [INFO] Proxy listening on :18804
+# [INFO] Forwarding to http://127.0.0.1:18801
 ```
 
-### Step 4: 配置 OpenClaw
+### 4.4 Systemd 服务
 
-在 OpenClaw 的 `openclaw.json` 中，将 `baseUrl` 改为代理地址：
-
-```json
-{
-  "baseUrl": "http://127.0.0.1:18804"
-}
-```
-
-重启 OpenClaw Gateway。
-
----
-
-## Systemd 服务（推荐）
-
-创建 `/etc/systemd/system/billing-proxy.service`：
+`/etc/systemd/system/billing-proxy.service`:
 
 ```ini
 [Unit]
-Description=OpenClaw Billing Proxy
-After=network.target
+Description=OpenClaw Billing Proxy (Plan B chain)
+After=network.target cliproxyapi.service
+Requires=cliproxyapi.service
 
 [Service]
 Type=simple
-User=your-user
-WorkingDirectory=/path/to/openclaw-billing-proxy
+User=apiadmin
+WorkingDirectory=/home/apiadmin/openclaw-billing-proxy
 ExecStart=/usr/bin/node proxy.js
 Restart=always
 RestartSec=3
@@ -144,40 +184,61 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable billing-proxy
-sudo systemctl start billing-proxy
+sudo systemctl enable --now billing-proxy
+sudo systemctl status billing-proxy
+```
+
+### 4.5 Nginx 路由配置
+
+```nginx
+# Claude 原生格式 → billing-proxy（走 body-level 伪装）
+location /v1/messages {
+    proxy_pass http://127.0.0.1:18804;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_buffering off;
+    proxy_http_version 1.1;
+    proxy_read_timeout 600s;
+    proxy_send_timeout 600s;
+}
+
+# OpenAI 兼容格式（GPT / Gemini / 跟 Claude 无关的路径）→ 直连 CLIProxyAPI
+# 不走 billing-proxy，因为我们的 body 变换是 Claude 专用
+location /v1/chat/completions { proxy_pass http://127.0.0.1:18801; }
+location /v1/responses        { proxy_pass http://127.0.0.1:18801; }
+
+# 管理面板
+location /management.html { proxy_pass http://127.0.0.1:18801; }
+location /v0/             { proxy_pass http://127.0.0.1:18801; }
+
+# 兜底：其他走 CLIProxyAPI
+location / { proxy_pass http://127.0.0.1:18801; }
+```
+
+### 4.6 客户端配置
+
+统一用一个 API key，两种接口格式都支持：
+
+```bash
+# OpenAI 兼容（多数客户端的默认）
+export ANTHROPIC_BASE_URL=https://your.domain/
+export ANTHROPIC_AUTH_TOKEN=sk-YourCustomKey
+
+# Anthropic 原生（Claude Code 等）
+curl https://your.domain/v1/messages \
+  -H "x-api-key: sk-YourCustomKey" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"claude-opus-4-6","max_tokens":500,"messages":[...]}'
 ```
 
 ---
 
-## 配合 CLIProxyAPI 使用
+## 五、工具名映射表
 
-如果你同时使用 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 管理多个 AI 模型，推荐以下架构：
+**CC 官方工具（无 `mcp_` 前缀）**：
 
-```
-:443 (Nginx + TLS)
-  ├─ /v1/messages*  → billing-proxy (:18804) → api.anthropic.com
-  │                   （Claude 走套餐）
-  ├─ /management*   → CLIProxyAPI (:18801)
-  │                   （管理面板）
-  └─ /* (其他 API)  → CLIProxyAPI (:18801)
-                      （GPT/Gemini/Codex 等）
-```
-
-CLIProxyAPI 改为内部端口（如 18801），关闭 TLS（由 Nginx 处理）：
-
-```yaml
-# CLIProxyAPI config.yaml
-port: 18801
-tls:
-  enable: false
-```
-
----
-
-## 工具名映射表
-
-| OpenClaw 工具名 | 伪装后（CC 风格） |
+| 原始 | 映射为 |
 |---|---|
 | exec | Bash |
 | process | BashSession |
@@ -194,104 +255,115 @@ tls:
 | send_to_task | TaskSend |
 | subagents | AgentControl |
 | session_status | StatusCheck |
-| web_search | WebSearch |
-| web_fetch | WebFetch |
-| pdf | PdfParse |
-| memory_search | KnowledgeSearch |
-| memory_get | KnowledgeGet |
-| yield_task | TaskYield |
-| task_store | TaskStore |
-| task_yield_interrupt | TaskYieldInterrupt |
+| read / write / edit / grep / glob / ls | Read / Write / Edit / Grep / Glob / LS |
 
-另外注入 5 个假 Claude Code 工具：`Glob`, `Grep`, `Agent`, `NotebookEdit`, `TodoRead`
+**非 CC 工具（带 `mcp_` 前缀，PR #48 引入）**：
+
+| 原始 | 映射为 |
+|---|---|
+| pdf | mcp_PdfParse |
+| image_generate | mcp_ImageCreate |
+| music_generate | mcp_MusicCreate |
+| video_generate | mcp_VideoCreate |
+| memory_search | mcp_KnowledgeSearch |
+| memory_get | mcp_KnowledgeGet |
+| lcm_expand_query | mcp_ContextQuery |
+| lcm_grep | mcp_ContextGrep |
+| lcm_describe | mcp_ContextDescribe |
+| lcm_expand | mcp_ContextExpand |
+| yield_task | mcp_TaskYield |
+| task_store | mcp_TaskStore |
+| task_yield_interrupt | mcp_TaskYieldInterrupt |
+
+另外注入 5 条假 CC 工具：`mcp_Glob` / `mcp_Grep` / `mcp_Agent` / `mcp_NotebookEdit` / `mcp_TodoRead`。`mcp_` 前缀告诉 Anthropic 这是"用户 MCP 工具"，不参与 CC 官方工具名匹配。
 
 ---
 
-## 关键词替换表
+## 六、关键词替换（Layer 2，双向）
 
 | 原始 | 替换为 |
 |---|---|
-| OpenClaw | OCPlatform |
-| openclaw | ocplatform |
-| sessions_spawn | create_task |
-| sessions_list | list_tasks |
-| sessions_history | get_history |
-| sessions_send | send_to_task |
-| sessions_yield | yield_task |
-| sessions_store | task_store |
-| HEARTBEAT_OK | HB_ACK |
-| running inside | running on |
+| OpenClaw / openclaw | OCPlatform / ocplatform |
+| LobeChat / lobechat | Driftwave / driftwave |
+| LobeHub / lobehub | Driftgate / driftgate |
+| NextChat / nextchat | Swiftline / swiftline |
+| `ChatGPT-Next-Web` | `Swiftline-Web` |
+| `x-anthropic-billing-header` | `x-meter-token` |
+| `x-anthropic-billing` | `x-meter-id` |
+| `cch=00000` | `mtx=00000` |
+| `cc_version` / `cc_entrypoint` | `mtx_version` / `mtx_entrypoint` |
+| `billing proxy` / `billing-proxy` | `metering bridge` / `metering-bridge` |
+| `extra usage` | `spare allowance` |
+| `assistant platform` | `tessera runtime` |
+| `sessions_spawn` / `sessions_list` / ... | `create_task` / `list_tasks` / ... |
+| `HEARTBEAT_OK` | `HB_ACK` |
 
-响应返回时**自动反向还原**，OpenClaw 无感知。
+共 40 条对称映射，响应返回时自动反向还原，客户端无感知。
 
 ---
 
-## 属性重命名
+## 七、属性重命名（Layer 6）
 
 | 原始属性 | 替换为 |
 |---|---|
 | session_id | thread_id |
 | conversation_id | thread_ref |
+| summaryIds / summary_id | chunk_ids / chunk_id |
+| system_event | event_text |
+| agent_id | worker_id |
+| wake_at / wake_event | trigger_at / trigger_event |
 
 ---
 
-## Header 伪装
+## 八、故障排查
 
-代理注入完整的 Claude Code HTTP Headers：
-
-- `User-Agent: claude-cli/{version} (external, cli)`
-- `anthropic-version: 2023-06-01`
-- `anthropic-beta: claude-code-20250219,oauth-2025-04-20,...`
-- 完整的 Stainless SDK headers（`x-stainless-*`）
-- `x-claude-code-session-id: {uuid}`
-
----
-
-## OAuth Token 管理
-
-- 从 `~/.claude/.credentials.json` 读取 Claude Code 的 OAuth token
-- 每次请求时刷新读取（支持 token 自动续期）
-- macOS 支持从 Keychain 提取
-
----
-
-## 故障排查
+**1. 检查整条链路是否通**
 
 ```bash
-node troubleshoot.js
+# 1. CLIProxyAPI 活着？
+curl http://127.0.0.1:18801/v1/models -H "Authorization: Bearer sk-YourCustomKey" | head
+
+# 2. billing-proxy 活着？
+curl http://127.0.0.1:18804/v1/messages \
+  -H "x-api-key: sk-YourCustomKey" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"claude-opus-4-6","max_tokens":20,"messages":[{"role":"user","content":"ping"}]}'
+
+# 3. nginx 终结层活着？
+curl -k https://your.domain/health
 ```
 
-检查：credentials 文件、token 有效性、网络连通性、API 响应。
+**2. 常见症状**
+
+| 症状 | 可能原因 |
+|---|---|
+| `unknown provider for model claude-opus-4-7` | CLIProxyAPI 版本太旧，需要升级以加入新模型 |
+| `Tool names must be unique` (400) | 客户端自带工具跟 CC_TOOL_STUBS 重名，升级到带 case-insensitive 去重的版本 |
+| 429 Extra Usage 增加 | 检查 `experimental-cch-signing` 是否开启；检查 Haiku 模型是否被发 effort 参数 |
+| `out of extra usage` 账号被拉黑 | 单独账号被限流，用 [claude-watchdog](../claude-watchdog)（配套 sidecar）自动降级 |
+| 客户端 15 秒 timeout | 非 SSE 响应 heartbeatfix 确认生效（本 Fork 已内置） |
 
 ---
 
-## 注意事项
+## 九、版本历史
 
-- 这是非官方工具，Anthropic 可能随时更新检测机制
-- 建议配合 `claude setup-token`（1 年有效期）使用，避免频繁 token 过期
-- 如果出现 "extra usage" 错误，运行 `node troubleshoot.js` 排查
-
----
-
-## 版本历史
-
-| 版本 | 日期 | 变更 |
+| 版本/提交 | 日期 | 变更 |
 |---|---|---|
-| v2.0 | 2026-04-08 | 四层检测对抗：工具名指纹绕过、系统模板剥离、描述删除、CC 工具注入 |
-| v1.4 | 2026-04-06 | macOS Keychain 支持 |
-| v1.3 | 2026-04-06 | 发现 HEARTBEAT_OK 触发词 |
-| v1.2 | 2026-04-05 | 双向反向映射 |
-| v1.1 | 2026-04-05 | 精简为 7 个已验证触发词 |
-| v1.0 | 2026-04-05 | 基础凭证替换 + 18 个替换规则 |
+| PR #48 port | 2026-04-21 | 移植 opencode-claude-auth 的 5 项 body-level 修复：`mcp_` 前缀（non-CC tools + stubs）、真 SHA256 CCH（替代 `cch=00000`）、Haiku `effort` 剥离、`repairToolPairs` 孤立 tool block 修复、Stainless SDK 版本升到 0.90.0（header 层，Plan B 下被 CLIProxyAPI 覆盖） |
+| Plan B 改造 | 2026-04-09 | `upstreamHost` 改为 `127.0.0.1:18801/http/x-api-key`；禁用 Anthropic-Beta header 注入以让 CLIProxyAPI 负责；禁用 cache_control 注入（后续又加回，因 CLIProxyAPI 不做 body 层注入）|
+| v2.2.4 | 2026-04-10 | 系统 prompt 边界用文件系统路径而不是 AGENTS.md（closes #26）|
+| PR #28 集成 | 2026-04-08 | thinking/redacted_thinking block 保护（mask/unmask）|
+| 本 Fork 独有 | 2026-04-09 起 | `count_tokens` 本地拦截、文件路径保护、prompt caching 注入、heartbeatfix（PR #40）|
 
 ---
 
-## License
+## 十、License & 致谢
 
-MIT
+MIT License. 基于 [zacdcook/openclaw-billing-proxy](https://github.com/zacdcook/openclaw-billing-proxy)，body-level 修复思路借鉴 [griffinmartin/opencode-claude-auth](https://github.com/griffinmartin/opencode-claude-auth) v1.4.10 (PR #48)。
 
----
+**配套 sidecar**（不在本仓库，单独部署）：
 
-## 致谢
+- `billing-logger` — 流量抓取 + SQLite 持久化 + Web 仪表盘（`/traffic-dashboard`），支持客户端 IP 筛选、按 upstream 筛选、全文搜索
+- `claude-watchdog` — 监听 CLIProxyAPI debug 日志，遇到账号被 rate-limit 自动降 priority，30 分钟后恢复
 
-基于 [zacdcook/openclaw-billing-proxy](https://github.com/zacdcook/openclaw-billing-proxy) 项目。
+这俩沿用 Plan B 架构的上下文，跟本 proxy 一起形成完整的 `nginx → logger → billing-proxy → CLIProxyAPI → Anthropic` 链路。
