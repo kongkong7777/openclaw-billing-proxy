@@ -69,7 +69,7 @@
 | **1. Billing 文本块注入** | 在 system 数组插入 `x-anthropic-billing-header: cc_version=<ver>.<fp>; cc_entrypoint=cli; cch=<sha256[:5]>;` 文本 | telemetry/指纹 |
 | **2. 关键词替换** | 40 组对称 sanitize（OpenClaw→OCPlatform / LobeChat→Driftwave / NextChat→Swiftline 等） | 品牌关键词扫描 |
 | **2.5. Haiku `effort` 剥离** | 侦测 Haiku 模型 → 剥掉 `output_config.effort` 和 `thinking.effort` | Haiku 对 effort 参数返 400 |
-| **3. 工具名重写** | 37 条 rename：CC 官方工具映射到 PascalCase（`read`→`Read`、`write`→`Write` 等），非 CC 工具加 `mcp_` 前缀（`pdf`→`mcp_PdfParse`、`music_generate`→`mcp_MusicCreate` 等）。**故意排除** `web_search` / `web_fetch` / `image` —— 这三个是 Anthropic 内置 `type` 标签，重命名会导致 `Input tag 'WebSearch' ... does not match expected tags` 400（详见 commit `ee0a591`） | 工具名集合指纹 |
+| **3. 工具名重写** | 37 条 rename 分两类：① **真 CC 原生工具**（`Bash`/`Read`/`Write`/`Edit`/`Grep`/`Glob`/`LS`）—— 不加前缀，让 Anthropic 识别为 CC。② **非 CC 工具** —— 一律加 `mcp_` 前缀（例如 `process`→`mcp_BashSession`、`pdf`→`mcp_PdfParse`），让 Anthropic 识别为用户 MCP 工具，不参与 CC 工具集对比。**故意排除** `web_search` / `web_fetch` / `image` —— 这三个是 Anthropic 内置 `type` 标签，重命名会导致 `Input tag 'WebSearch' ... does not match expected tags` 400（详见 commit `ee0a591`） | 工具名集合指纹 |
 | **4. System prompt 剥离** | 删除 OpenClaw 配置段（~28K 字符 tooling/workspace/messaging 模板），替换为简短自然语言 | 系统模板签名 |
 | **5. CC_TOOL_STUBS 注入** | 在 tools 数组追加 `mcp_Glob` / `mcp_Grep` / `mcp_Agent` / `mcp_NotebookEdit` / `mcp_TodoRead` 5 条假工具，带 case-insensitive 去重 | 工具集对比 CC 基线 |
 | **6. 属性名重写** | `session_id`→`thread_id` / `conversation_id`→`thread_ref` 等 8 条 | schema 属性指纹 |
@@ -271,31 +271,40 @@ any of the expected tags: 'web_search_20250305', 'web_search_20260209', ...
 
 版本号跟随 Anthropic 官方更新；以 API 返回的 expected tags 为准。
 
-### 表二：CC 原生工具（无 `mcp_` 前缀）
+### 表二：映射到真 CC 原生工具（无 `mcp_` 前缀）
+
+**只有**这些对应真 CC 2.x 实际存在的工具（`Bash` / `Read` / `Write` / `Edit` / `Grep` / `Glob` / `LS`），所以无前缀发到 Anthropic 会被识别为 CC 流量：
 
 | 原始 | 映射为 |
 |---|---|
 | exec | Bash |
-| process | BashSession |
-| browser | BrowserControl |
-| canvas | CanvasView |
-| cron | Scheduler |
-| message | SendMessage |
-| tts | Speech |
-| gateway | SystemCtl |
-| agents_list | AgentList |
-| create_task | TaskCreate |
-| list_tasks | TaskList |
-| get_history | TaskHistory |
-| send_to_task | TaskSend |
-| subagents | AgentControl |
-| session_status | StatusCheck |
-| read / write / edit / grep / glob / ls | Read / Write / Edit / Grep / Glob / LS |
+| read | Read |
+| write | Write |
+| edit | Edit |
+| grep | Grep |
+| glob | Glob |
+| ls | LS |
 
-### 表三：非 CC 的 MCP 工具（带 `mcp_` 前缀，PR #48 引入）
+### 表三：映射到 MCP 用户工具（带 `mcp_` 前缀）
+
+所有**非真 CC 原生**的工具一律加 `mcp_` 前缀 —— Anthropic 会把它们识别为用户自定义 MCP 工具，不参与 CC 工具集指纹对比。
 
 | 原始 | 映射为 |
 |---|---|
+| process | mcp_BashSession |
+| browser | mcp_BrowserControl |
+| canvas | mcp_CanvasView |
+| cron | mcp_Scheduler |
+| message | mcp_SendMessage |
+| tts | mcp_Speech |
+| gateway | mcp_SystemCtl |
+| agents_list | mcp_AgentList |
+| create_task | mcp_TaskCreate |
+| list_tasks | mcp_TaskList |
+| get_history | mcp_TaskHistory |
+| send_to_task | mcp_TaskSend |
+| subagents | mcp_AgentControl |
+| session_status | mcp_StatusCheck |
 | pdf | mcp_PdfParse |
 | image_generate | mcp_ImageCreate |
 | music_generate | mcp_MusicCreate |
@@ -310,7 +319,13 @@ any of the expected tags: 'web_search_20250305', 'web_search_20260209', ...
 | task_store | mcp_TaskStore |
 | task_yield_interrupt | mcp_TaskYieldInterrupt |
 
-另外注入 5 条假 CC 工具：`mcp_Glob` / `mcp_Grep` / `mcp_Agent` / `mcp_NotebookEdit` / `mcp_TodoRead`。`mcp_` 前缀告诉 Anthropic 这是"用户 MCP 工具"，不参与 CC 官方工具名匹配。
+**Layer 5 注入的 5 条假 CC stub 也带 `mcp_` 前缀**：`mcp_Glob` / `mcp_Grep` / `mcp_Agent` / `mcp_NotebookEdit` / `mcp_TodoRead`。
+
+### 反向映射自动处理
+
+响应里 Anthropic 返回的 tool_use block 会以**原始工具名**返给客户端（例如客户端发 `process`，Anthropic 收到 `mcp_BashSession`，响应 reverse 后客户端看到 `process`）。实现细节：`reverseMap()` 函数用同一个 `toolRenames` 数组反向遍历，无需维护独立的反向表。
+
+如果工具映射还经过 Layer 2 sanitize（例如 `sessions_spawn` 的链路是 `sessions_spawn` → `create_task` → `mcp_TaskCreate`），反向时会先经 Layer 3 reverse 回到 `create_task`，再经 DEFAULT_REVERSE_MAP 还原为 `sessions_spawn`，客户端完全无感。
 
 ---
 
@@ -384,6 +399,7 @@ curl -k https://your.domain/health
 
 | 版本/提交 | 日期 | 变更 |
 |---|---|---|
+| mcp_ 前缀一致化 | 2026-04-21 | 把剩余 14 条"伪 CC 名"（`BashSession` / `BrowserControl` / `TaskCreate` 等非真 CC 工具）也改成 `mcp_` 前缀，保证**只有**真 CC 原生工具（`Bash`/`Read`/`Write`/`Edit`/`Grep`/`Glob`/`LS`）无前缀。PR #48 只改了 13 条最明显的非 CC 工具，这次把整个 rename 表统一了逻辑 |
 | PR #48 port | 2026-04-21 | 移植 opencode-claude-auth 的 5 项 body-level 修复：`mcp_` 前缀（non-CC tools + stubs）、真 SHA256 CCH（替代 `cch=00000`）、Haiku `effort` 剥离、`repairToolPairs` 孤立 tool block 修复、Stainless SDK 版本升到 0.90.0（header 层，Plan B 下被 CLIProxyAPI 覆盖） |
 | Plan B 改造 | 2026-04-09 | `upstreamHost` 改为 `127.0.0.1:18801/http/x-api-key`；禁用 Anthropic-Beta header 注入以让 CLIProxyAPI 负责；禁用 cache_control 注入（后续又加回，因 CLIProxyAPI 不做 body 层注入）|
 | v2.2.4 | 2026-04-10 | 系统 prompt 边界用文件系统路径而不是 AGENTS.md（closes #26）|
