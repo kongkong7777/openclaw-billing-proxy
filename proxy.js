@@ -83,11 +83,11 @@ function getModelBetas(model) {
 // CC tool stubs -- injected into tools array to make the tool set look more
 // like a Claude Code session. The model won't call these (schemas are minimal).
 const CC_TOOL_STUBS = [
-  '{"name":"Glob","description":"Find files by pattern","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern"}},"required":["pattern"]}}',
-  '{"name":"Grep","description":"Search file contents","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern"},"path":{"type":"string","description":"Search path"}},"required":["pattern"]}}',
-  '{"name":"Agent","description":"Launch a subagent for complex tasks","input_schema":{"type":"object","properties":{"prompt":{"type":"string","description":"Task description"}},"required":["prompt"]}}',
-  '{"name":"NotebookEdit","description":"Edit notebook cells","input_schema":{"type":"object","properties":{"notebook_path":{"type":"string"},"cell_index":{"type":"integer"}},"required":["notebook_path"]}}',
-  '{"name":"TodoRead","description":"Read current task list","input_schema":{"type":"object","properties":{}}}'
+  '{"name":"mcp_Glob","description":"Find files by pattern","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern"}},"required":["pattern"]}}',
+  '{"name":"mcp_Grep","description":"Search file contents","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern"},"path":{"type":"string","description":"Search path"}},"required":["pattern"]}}',
+  '{"name":"mcp_Agent","description":"Launch a subagent for complex tasks","input_schema":{"type":"object","properties":{"prompt":{"type":"string","description":"Task description"}},"required":["prompt"]}}',
+  '{"name":"mcp_NotebookEdit","description":"Edit notebook cells","input_schema":{"type":"object","properties":{"notebook_path":{"type":"string"},"cell_index":{"type":"integer"}},"required":["notebook_path"]}}',
+  '{"name":"mcp_TodoRead","description":"Read current task list","input_schema":{"type":"object","properties":{}}}'
 ];
 
 // ─── Billing Fingerprint ────────────────────────────────────────────────────
@@ -144,11 +144,16 @@ function extractFirstUserText(bodyStr) {
     .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
 }
 
-function buildBillingBlock(bodyStr) {
-  const firstText = extractFirstUserText(bodyStr);
+function computeCch(text) {
+  return crypto.createHash('sha256').update(text).digest('hex').slice(0, 5);
+}
+
+function buildBillingBlock(bodyStr, preExtractedText) {
+  const firstText = preExtractedText !== undefined ? preExtractedText : extractFirstUserText(bodyStr);
   const fingerprint = computeBillingFingerprint(firstText);
   const ccVersion = `${CC_VERSION}.${fingerprint}`;
-  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=cli; cch=00000;"}`;
+  const cch = computeCch(firstText);
+  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=cli; cch=${cch};"}`;
 }
 
 // ─── Stainless SDK Headers ──────────────────────────────────────────────────
@@ -164,7 +169,7 @@ function getStainlessHeaders() {
     'x-stainless-arch': arch,
     'x-stainless-lang': 'js',
     'x-stainless-os': osName,
-    'x-stainless-package-version': '0.81.0',
+    'x-stainless-package-version': '0.90.0',
     'x-stainless-runtime': 'node',
     'x-stainless-runtime-version': process.version,
     'x-stainless-retry-count': '0',
@@ -261,19 +266,19 @@ const DEFAULT_TOOL_RENAMES = [
   //   using 'type' does not match any of the expected tags
   // The fingerprint signal lost from one tool name is much smaller than the
   // certainty of breaking every conversation that ever touched an image. (issue #14)
-  ['pdf', 'PdfParse'],
-  ['image_generate', 'ImageCreate'],
-  ['music_generate', 'MusicCreate'],
-  ['video_generate', 'VideoCreate'],
-  ['memory_search', 'KnowledgeSearch'],
-  ['memory_get', 'KnowledgeGet'],
-  ['lcm_expand_query', 'ContextQuery'],
-  ['lcm_grep', 'ContextGrep'],
-  ['lcm_describe', 'ContextDescribe'],
-  ['lcm_expand', 'ContextExpand'],
-  ['yield_task', 'TaskYield'],
-  ['task_store', 'TaskStore'],
-  ['task_yield_interrupt', 'TaskYieldInterrupt'],
+  ['pdf', 'mcp_PdfParse'],
+  ['image_generate', 'mcp_ImageCreate'],
+  ['music_generate', 'mcp_MusicCreate'],
+  ['video_generate', 'mcp_VideoCreate'],
+  ['memory_search', 'mcp_KnowledgeSearch'],
+  ['memory_get', 'mcp_KnowledgeGet'],
+  ['lcm_expand_query', 'mcp_ContextQuery'],
+  ['lcm_grep', 'mcp_ContextGrep'],
+  ['lcm_describe', 'mcp_ContextDescribe'],
+  ['lcm_expand', 'mcp_ContextExpand'],
+  ['yield_task', 'mcp_TaskYield'],
+  ['task_store', 'mcp_TaskStore'],
+  ['task_yield_interrupt', 'mcp_TaskYieldInterrupt'],
   // File operation tools — OpenClaw sends these lowercase but CC_TOOL_STUBS
   // inject TitleCase versions. Without renames, both coexist in the tools
   // array, causing infinite tool-not-found retry loops (issue #43).
@@ -553,6 +558,49 @@ function estimateTokenCount(bodyStr) {
   return Math.max(1, Math.round(base * 1.05));
 }
 
+// String-aware brace matching: skips {/} inside JSON string values.
+// Counterpart to findMatchingBracket which handles [/] only.
+function findMatchingBrace(str, start) {
+  let d = 0, inStr = false;
+  for (let i = start; i < str.length; i++) {
+    const c = str[i];
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '{') d++;
+    else if (c === '}') { d--; if (d === 0) return i; }
+  }
+  return -1;
+}
+
+// Strips "effort" key-value from an object (by key name) in a raw JSON string.
+// Uses findMatchingBrace to safely handle nested structures.
+function stripEffortFromObject(str, objectKey) {
+  const keyPattern = '"' + objectKey + '"';
+  let pos = str.indexOf(keyPattern);
+  if (pos === -1) return str;
+  let braceStart = str.indexOf('{', pos + keyPattern.length);
+  if (braceStart === -1) return str;
+  const braceEnd = findMatchingBrace(str, braceStart);
+  if (braceEnd === -1) return str;
+  const inner = str.slice(braceStart + 1, braceEnd);
+  let cleaned = inner
+    .replace(/,\s*"effort"\s*:\s*(?:"[^"]*"|\d+(?:\.\d+)?|true|false|null)/, '')
+    .replace(/"effort"\s*:\s*(?:"[^"]*"|\d+(?:\.\d+)?|true|false|null),?\s*/, '');
+  cleaned = cleaned.replace(/,\s*$/, '').trim();
+  if (cleaned === '') {
+    const keyStart = str.lastIndexOf(',', pos);
+    if (keyStart !== -1 && str.slice(keyStart, pos).trim() === ',') {
+      return str.slice(0, keyStart) + str.slice(braceEnd + 1);
+    }
+    return str.slice(0, pos) + str.slice(braceEnd + 1);
+  }
+  return str.slice(0, braceStart + 1) + cleaned + str.slice(braceEnd);
+}
+
 // ─── Thinking Block Protection ──────────────────────────────────────────────
 // Anthropic requires thinking/redacted_thinking content blocks to be echoed
 // back byte-identical to what the model originally produced; any mutation
@@ -695,8 +743,75 @@ function ensureCacheControl(m) {
   return m;
 }
 
+// ─── Tool Pair Repair ───────────────────────────────────────────────────────
+// Removes orphaned tool_use / tool_result blocks from conversation history.
+// An orphaned tool_use has no matching tool_result; an orphaned tool_result
+// has no matching tool_use. Both cause Anthropic API validation errors.
+// Ported from opencode-claude-auth/src/transforms.ts repairToolPairs().
+function repairToolPairs(bodyStr) {
+  const msgsStart = bodyStr.indexOf('"messages":[');
+  if (msgsStart === -1) return bodyStr;
+  const arrayOpenIdx = msgsStart + '"messages":'.length;
+  const arrayCloseIdx = findMatchingBracket(bodyStr, arrayOpenIdx);
+  if (arrayCloseIdx === -1) return bodyStr;
+  const messagesJson = bodyStr.slice(arrayOpenIdx, arrayCloseIdx + 1);
+  let messages;
+  try { messages = JSON.parse(messagesJson); } catch (e) {
+    console.warn('[REPAIR] parse failed:', e.message);
+    return bodyStr;
+  }
+  if (!Array.isArray(messages)) return bodyStr;
+  const toolUseIds = new Set();
+  const toolResultIds = new Set();
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (block.type === 'tool_use' && typeof block.id === 'string') toolUseIds.add(block.id);
+      if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') toolResultIds.add(block.tool_use_id);
+    }
+  }
+  const orphanedUses = new Set();
+  for (const id of toolUseIds) if (!toolResultIds.has(id)) orphanedUses.add(id);
+  const orphanedResults = new Set();
+  for (const id of toolResultIds) if (!toolUseIds.has(id)) orphanedResults.add(id);
+  if (orphanedUses.size === 0 && orphanedResults.size === 0) return bodyStr;
+  console.log(`[REPAIR] Removing ${orphanedUses.size} orphaned tool_use and ${orphanedResults.size} orphaned tool_result blocks`);
+  const candidateRepaired = messages.map((message) => {
+    if (!Array.isArray(message.content)) return message;
+    const filtered = message.content.filter((block) => {
+      if (block.type === 'tool_use' && typeof block.id === 'string') return !orphanedUses.has(block.id);
+      if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') return !orphanedResults.has(block.tool_use_id);
+      return true;
+    });
+    if (filtered.length === 0) return null;
+    return { ...message, content: filtered };
+  });
+  const repaired = [];
+  for (let i = 0; i < candidateRepaired.length; i++) {
+    if (candidateRepaired[i] !== null) {
+      repaired.push(candidateRepaired[i]);
+    } else {
+      const prevRole = repaired.length > 0 ? repaired[repaired.length - 1].role : null;
+      const nextMsg = candidateRepaired.slice(i + 1).find(m => m !== null);
+      const nextRole = nextMsg ? nextMsg.role : null;
+      if (prevRole && nextRole && prevRole === nextRole) {
+        repaired.push({ ...messages[i], content: [{ type: 'text', text: '(removed)' }] });
+      }
+    }
+  }
+  const repairedJson = JSON.stringify(repaired);
+  return bodyStr.slice(0, arrayOpenIdx) + repairedJson + bodyStr.slice(arrayCloseIdx + 1);
+}
+
 // ─── Request Processing ─────────────────────────────────────────────────────
 function processBody(bodyStr, config, reqPath) {
+  // Repair orphaned tool_use/tool_result pairs before any transforms.
+  // Must run on the original body (pre-masking) since masking corrupts JSON.parse.
+  bodyStr = repairToolPairs(bodyStr);
+
+  // Extract original first user text for billing fingerprint BEFORE any transforms
+  const originalFirstUserText = extractFirstUserText(bodyStr);
+
   // Mask thinking/redacted_thinking content blocks from the transform pipeline
   // so Layer 2/3/6 split/join can't mutate assistant history. Restored before
   // return. See "Thinking Block Protection" above.
@@ -736,6 +851,16 @@ function processBody(bodyStr, config, reqPath) {
     m = m.split(find).join(replace);
   }
   m = unmaskPaths(m, pathMasks);
+
+  // Layer 2.5: Strip effort param for Haiku models (Haiku rejects effort with 400)
+  {
+    const modelMatch = /"model"\s*:\s*"([^"]+)"/.exec(m);
+    if (modelMatch && modelMatch[1].toLowerCase().includes('haiku')) {
+      m = stripEffortFromObject(m, 'output_config');
+      m = stripEffortFromObject(m, 'thinking');
+      console.log('[EFFORT] Stripped effort param for Haiku model: ' + modelMatch[1]);
+    }
+  }
 
   // Layer 3: Tool name fingerprint bypass (quoted replacement for precision)
   for (const [orig, cc] of config.toolRenames) {
@@ -846,7 +971,7 @@ function processBody(bodyStr, config, reqPath) {
   }
 
   // Layer 1: Billing header injection (dynamic fingerprint per request)
-  const BILLING_BLOCK = buildBillingBlock(m);
+  const BILLING_BLOCK = buildBillingBlock(m, originalFirstUserText);
   const sysArrayIdx = m.indexOf('"system":[');
   if (sysArrayIdx !== -1) {
     const insertAt = sysArrayIdx + '"system":['.length;
