@@ -65,10 +65,11 @@
 
 | Layer | 作用 | 对应 Anthropic 检测 |
 |-------|------|---|
+| **0. Anthropic 内置工具版本化** | `{"type":"web_search"}` → `{"type":"web_search_20260209"}` 等 8 条 shorthand → versioned 映射（web_search / web_fetch / text_editor / code_execution / bash / memory / tool_search_tool_bm25 / tool_search_tool_regex）。**这些内置工具不经 Layer 3 重命名**，否则会跟 `type` 字段机制冲突触发 400 | Anthropic 内置工具接入 |
 | **1. Billing 文本块注入** | 在 system 数组插入 `x-anthropic-billing-header: cc_version=<ver>.<fp>; cc_entrypoint=cli; cch=<sha256[:5]>;` 文本 | telemetry/指纹 |
 | **2. 关键词替换** | 40 组对称 sanitize（OpenClaw→OCPlatform / LobeChat→Driftwave / NextChat→Swiftline 等） | 品牌关键词扫描 |
 | **2.5. Haiku `effort` 剥离** | 侦测 Haiku 模型 → 剥掉 `output_config.effort` 和 `thinking.effort` | Haiku 对 effort 参数返 400 |
-| **3. 工具名重写** | 37 条 rename：CC 官方工具映射到 PascalCase（`read`→`Read`、`write`→`Write` 等），非 CC 工具加 `mcp_` 前缀（`pdf`→`mcp_PdfParse`、`music_generate`→`mcp_MusicCreate` 等） | 工具名集合指纹 |
+| **3. 工具名重写** | 37 条 rename：CC 官方工具映射到 PascalCase（`read`→`Read`、`write`→`Write` 等），非 CC 工具加 `mcp_` 前缀（`pdf`→`mcp_PdfParse`、`music_generate`→`mcp_MusicCreate` 等）。**故意排除** `web_search` / `web_fetch` / `image` —— 这三个是 Anthropic 内置 `type` 标签，重命名会导致 `Input tag 'WebSearch' ... does not match expected tags` 400（详见 commit `ee0a591`） | 工具名集合指纹 |
 | **4. System prompt 剥离** | 删除 OpenClaw 配置段（~28K 字符 tooling/workspace/messaging 模板），替换为简短自然语言 | 系统模板签名 |
 | **5. CC_TOOL_STUBS 注入** | 在 tools 数组追加 `mcp_Glob` / `mcp_Grep` / `mcp_Agent` / `mcp_NotebookEdit` / `mcp_TodoRead` 5 条假工具，带 case-insensitive 去重 | 工具集对比 CC 基线 |
 | **6. 属性名重写** | `session_id`→`thread_id` / `conversation_id`→`thread_ref` 等 8 条 | schema 属性指纹 |
@@ -236,7 +237,41 @@ curl https://your.domain/v1/messages \
 
 ## 五、工具名映射表
 
-**CC 官方工具（无 `mcp_` 前缀）**：
+### ⚠️ 三类工具的不同处理
+
+proxy.js 对工具做**三类不同**处理，搞混会导致 Anthropic 返回 400：
+
+| 类别 | 举例 | 处理方式 | 对应 Layer |
+|---|---|---|---|
+| **Anthropic 内置工具** | `web_search` / `web_fetch` / `text_editor` / `code_execution` / `bash` / `memory` / `tool_search_tool_bm25` / `tool_search_tool_regex` | **绝不重命名**！只做 `type` 字段的 shorthand → versioned 映射（如 `web_search` → `web_search_20260209`） | Layer 0 |
+| **CC 原生工具（客户端用的）** | `read` / `write` / `edit` / `grep` / `glob` / `ls` / `exec` / `process` / ... | 重命名到 PascalCase（`Read` / `Write` / `Bash` 等，无前缀） | Layer 3 |
+| **非 CC 的 MCP 工具** | `pdf` / `image_generate` / `music_generate` / `memory_search` / `lcm_*` / `yield_task` / ... | 重命名 + `mcp_` 前缀（如 `pdf` → `mcp_PdfParse`） | Layer 3 |
+
+**关键规则**：Anthropic 内置工具（第一类）用 `type` 字段在 API 里做版本识别，如果我们还把 `"web_search"` 重命名成 `"WebSearch"`，Anthropic 会返回：
+
+```
+tools.N: Input tag 'WebSearch' found using 'type' does not match
+any of the expected tags: 'web_search_20250305', 'web_search_20260209', ...
+```
+
+同理 `image` 类型内容块的 `type: "image"` 也会被误替，在 tool_result 里渲染的图会报 400（issue #14）。这些工具**从 `DEFAULT_TOOL_RENAMES` 里显式排除**，见 proxy.js 里的 NOTE 注释。
+
+### 表一：Anthropic 内置工具（Layer 0 版本化，不改名）
+
+| 客户端可发送的 shorthand | Layer 0 映射为（发给 Anthropic） |
+|---|---|
+| `web_search` | `web_search_20260209` |
+| `web_fetch` | `web_fetch_20260309` |
+| `text_editor` | `text_editor_20250728` |
+| `code_execution` | `code_execution_20260120` |
+| `bash` | `bash_20250124` |
+| `memory` | `memory_20250818` |
+| `tool_search_tool_bm25` | `tool_search_tool_bm25_20251119` |
+| `tool_search_tool_regex` | `tool_search_tool_regex_20251119` |
+
+版本号跟随 Anthropic 官方更新；以 API 返回的 expected tags 为准。
+
+### 表二：CC 原生工具（无 `mcp_` 前缀）
 
 | 原始 | 映射为 |
 |---|---|
@@ -257,7 +292,7 @@ curl https://your.domain/v1/messages \
 | session_status | StatusCheck |
 | read / write / edit / grep / glob / ls | Read / Write / Edit / Grep / Glob / LS |
 
-**非 CC 工具（带 `mcp_` 前缀，PR #48 引入）**：
+### 表三：非 CC 的 MCP 工具（带 `mcp_` 前缀，PR #48 引入）
 
 | 原始 | 映射为 |
 |---|---|
