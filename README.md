@@ -67,7 +67,7 @@
 |-------|------|---|
 | **0. Anthropic 内置工具版本化** | `{"type":"web_search"}` → `{"type":"web_search_20260209"}` 等 8 条 shorthand → versioned 映射（web_search / web_fetch / text_editor / code_execution / bash / memory / tool_search_tool_bm25 / tool_search_tool_regex）。**这些内置工具不经 Layer 3 重命名**，否则会跟 `type` 字段机制冲突触发 400 | Anthropic 内置工具接入 |
 | **1. Billing 文本块注入** | 在 system 数组插入 `x-anthropic-billing-header: cc_version=<ver>.<fp>; cc_entrypoint=cli; cch=<sha256[:5]>;` 文本 | telemetry/指纹 |
-| **2. 关键词替换** | 40 组对称 sanitize（OpenClaw→OCPlatform / LobeChat→Driftwave / NextChat→Swiftline 等） | 品牌关键词扫描 |
+| **2. 关键词替换** | 56 组对称 sanitize（OpenClaw→OCPlatform / LobeChat→Driftwave / NextChat→Swiftline / **Hermes→Tideline / NousResearch→LumeonLabs** 等）| 品牌关键词扫描 |
 | **2.5. Haiku `effort` 剥离** | 侦测 Haiku 模型 → 剥掉 `output_config.effort` 和 `thinking.effort` | Haiku 对 effort 参数返 400 |
 | **3. 工具名重写** | 37 条 rename 分两类：① **真 CC 原生工具**（`Bash`/`Read`/`Write`/`Edit`/`Grep`/`Glob`/`LS`）—— 不加前缀，让 Anthropic 识别为 CC。② **非 CC 工具** —— 一律加 `mcp_` 前缀（例如 `process`→`mcp_BashSession`、`pdf`→`mcp_PdfParse`），让 Anthropic 识别为用户 MCP 工具，不参与 CC 工具集对比。**故意排除** `web_search` / `web_fetch` / `image` —— 这三个是 Anthropic 内置 `type` 标签，重命名会导致 `Input tag 'WebSearch' ... does not match expected tags` 400（详见 commit `ee0a591`） | 工具名集合指纹 |
 | **4. System prompt 剥离** | 删除 OpenClaw 配置段（~28K 字符 tooling/workspace/messaging 模板），替换为简短自然语言 | 系统模板签名 |
@@ -333,11 +333,28 @@ any of the expected tags: 'web_search_20250305', 'web_search_20260209', ...
 
 | 原始 | 替换为 |
 |---|---|
+### 客户端品牌词
+
+| 原始 | 替换为 |
+|---|---|
 | OpenClaw / openclaw | OCPlatform / ocplatform |
 | LobeChat / lobechat | Driftwave / driftwave |
 | LobeHub / lobehub | Driftgate / driftgate |
 | NextChat / nextchat | Swiftline / swiftline |
 | `ChatGPT-Next-Web` | `Swiftline-Web` |
+| **`Hermes` / `hermes` / `HERMES`** | **`Tideline` / `tideline` / `TIDELINE`** |
+| **`Hermes Agent` / `HermesAgent` / `hermes-agent`** | **`Tideline Agent` / `TidelineAgent` / `tideline-agent`** |
+| **`hermes-gateway`** | **`tideline-gateway`** |
+| **`SOUL.md`** | **`SPARK.md`** |
+| **`NousResearch` / `nousresearch` / `Nous Research`** | **`LumeonLabs` / `lumeonlabs` / `Lumeon Labs`** |
+| **`Nous Portal` / `nous portal`** | **`Lumeon Portal` / `lumeon portal`** |
+| **`NOUS_`**（覆盖所有 `NOUS_*` env vars） | **`LUMEON_`** |
+| `nousresearch.com` | `lumeonlabs.io` |
+
+### Billing / 控制平面词
+
+| 原始 | 替换为 |
+|---|---|
 | `x-anthropic-billing-header` | `x-meter-token` |
 | `x-anthropic-billing` | `x-meter-id` |
 | `cch=00000` | `mtx=00000` |
@@ -348,7 +365,9 @@ any of the expected tags: 'web_search_20250305', 'web_search_20260209', ...
 | `sessions_spawn` / `sessions_list` / ... | `create_task` / `list_tasks` / ... |
 | `HEARTBEAT_OK` | `HB_ACK` |
 
-共 40 条对称映射，响应返回时自动反向还原，客户端无感知。
+共 56 条对称映射，**响应返回时自动反向还原**，客户端无感知。
+
+**Hermes 词表的关键巧思**：`HERMES` 和 `NOUS_` 这种全大写 / 前缀形式利用了 `String.split().join()` 是**substring 替换**的特性，一条规则覆盖所有变体（如 `HERMES_HOME` / `HERMES_TIMEZONE` / `HERMES_BUNDLED_SKILLS` / `HERMES_WEB_DIST` 等 6+ 个 env var，以及 `~/.hermes/` 类路径全部一并处理）。未来 Hermes 加新 env var 不需要改词表。
 
 ---
 
@@ -403,6 +422,7 @@ curl -k https://your.domain/health
 | PR #48 port | 2026-04-21 | 移植 opencode-claude-auth 的 5 项 body-level 修复：`mcp_` 前缀（non-CC tools + stubs）、真 SHA256 CCH（替代 `cch=00000`）、Haiku `effort` 剥离、`repairToolPairs` 孤立 tool block 修复、Stainless SDK 版本升到 0.90.0（header 层，Plan B 下被 CLIProxyAPI 覆盖） |
 | Plan B 改造 | 2026-04-09 | `upstreamHost` 改为 `127.0.0.1:18801/http/x-api-key`；禁用 Anthropic-Beta header 注入以让 CLIProxyAPI 负责；禁用 cache_control 注入（后续又加回，因 CLIProxyAPI 不做 body 层注入）|
 | v2.2.4 | 2026-04-10 | 系统 prompt 边界用文件系统路径而不是 AGENTS.md（closes #26）|
+| Hermes / NousResearch 词表 | 2026-04-28 | Layer 2 新增 16 对 Hermes 品牌字符串：`Hermes`/`HERMES`/`Hermes Agent`/`hermes-agent`/`hermes-gateway`/`SOUL.md`/`NousResearch`/`Nous Portal`/`NOUS_` 等全部映射到 `Tideline`/`LumeonLabs` 主题。`HERMES`/`NOUS_` 通过 substring 替换一条覆盖所有 `HERMES_*`/`NOUS_*` env var |
 | PR #28 集成 | 2026-04-08 | thinking/redacted_thinking block 保护（mask/unmask）|
 | 本 Fork 独有 | 2026-04-09 起 | `count_tokens` 本地拦截、文件路径保护、prompt caching 注入、heartbeatfix（PR #40）|
 
